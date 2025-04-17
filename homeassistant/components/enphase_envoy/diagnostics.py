@@ -66,16 +66,19 @@ async def _get_fixture_collection(envoy: Envoy, serial: str) -> dict[str, Any]:
     ]
 
     for end_point in end_points:
-        response = await envoy.request(end_point)
-        fixture_data[end_point] = response.text.replace("\n", "").replace(
-            serial, CLEAN_TEXT
-        )
-        fixture_data[f"{end_point}_log"] = json_dumps(
-            {
-                "headers": dict(response.headers.items()),
-                "code": response.status_code,
-            }
-        )
+        try:
+            response = await envoy.request(end_point)
+            fixture_data[end_point] = response.text.replace("\n", "").replace(
+                serial, CLEAN_TEXT
+            )
+            fixture_data[f"{end_point}_log"] = json_dumps(
+                {
+                    "headers": dict(response.headers.items()),
+                    "code": response.status_code,
+                }
+            )
+        except EnvoyError as err:
+            fixture_data[f"{end_point}_log"] = {"Error": repr(err)}
     return fixture_data
 
 
@@ -104,8 +107,12 @@ async def async_get_config_entry_diagnostics(
             if state := hass.states.get(entity.entity_id):
                 state_dict = dict(state.as_dict())
                 state_dict.pop("context", None)
-            entities.append({"entity": asdict(entity), "state": state_dict})
-        device_entities.append({"device": asdict(device), "entities": entities})
+            entity_dict = asdict(entity)
+            entity_dict.pop("_cache", None)
+            entities.append({"entity": entity_dict, "state": state_dict})
+        device_dict = asdict(device)
+        device_dict.pop("_cache", None)
+        device_entities.append({"device": device_dict, "entities": entities})
 
     # remove envoy serial
     old_serial = coordinator.envoy_serial_number
@@ -156,10 +163,7 @@ async def async_get_config_entry_diagnostics(
 
     fixture_data: dict[str, Any] = {}
     if entry.options.get(OPTION_DIAGNOSTICS_INCLUDE_FIXTURES, False):
-        try:
-            fixture_data = await _get_fixture_collection(envoy=envoy, serial=old_serial)
-        except EnvoyError as err:
-            fixture_data["Error"] = repr(err)
+        fixture_data = await _get_fixture_collection(envoy=envoy, serial=old_serial)
 
     diagnostic_data: dict[str, Any] = {
         "config_entry": async_redact_data(entry.as_dict(), TO_REDACT),

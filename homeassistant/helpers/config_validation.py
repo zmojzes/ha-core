@@ -1,10 +1,8 @@
 """Helpers for config validation using voluptuous."""
 
-# PEP 563 seems to break typing.get_type_hints when used
-# with PEP 695 syntax. Fixed in Python 3.13.
-# from __future__ import annotations
+from __future__ import annotations
 
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Mapping
 import contextlib
 from contextvars import ContextVar
 from datetime import (
@@ -81,6 +79,8 @@ from homeassistant.const import (
     CONF_TARGET,
     CONF_THEN,
     CONF_TIMEOUT,
+    CONF_TRIGGER,
+    CONF_TRIGGERS,
     CONF_UNTIL,
     CONF_VALUE_TEMPLATE,
     CONF_VARIABLES,
@@ -107,8 +107,11 @@ from homeassistant.exceptions import HomeAssistantError, TemplateError
 from homeassistant.generated import currencies
 from homeassistant.generated.countries import COUNTRIES
 from homeassistant.generated.languages import LANGUAGES
-from homeassistant.util import raise_if_invalid_path, slugify as util_slugify
-import homeassistant.util.dt as dt_util
+from homeassistant.util import (
+    dt as dt_util,
+    raise_if_invalid_path,
+    slugify as util_slugify,
+)
 from homeassistant.util.yaml.objects import NodeStrClass
 
 from . import script_variables as script_variables_helper, template as template_helper
@@ -352,7 +355,7 @@ def ensure_list[_T](value: _T | None) -> list[_T] | list[Any]:
     """Wrap value in list if it is not one."""
     if value is None:
         return []
-    return cast("list[_T]", value) if isinstance(value, list) else [value]
+    return cast(list[_T], value) if isinstance(value, list) else [value]
 
 
 def entity_id(value: Any) -> str:
@@ -674,11 +677,7 @@ def string(value: Any) -> str:
         raise vol.Invalid("string value is None")
 
     # This is expected to be the most common case, so check it first.
-    if (
-        type(value) is str  # noqa: E721
-        or type(value) is NodeStrClass
-        or isinstance(value, str)
-    ):
+    if type(value) is str or type(value) is NodeStrClass or isinstance(value, str):
         return value
 
     if isinstance(value, template_helper.ResultWrapper):
@@ -715,8 +714,19 @@ def template(value: Any | None) -> template_helper.Template:
         raise vol.Invalid("template value is None")
     if isinstance(value, (list, dict, template_helper.Template)):
         raise vol.Invalid("template value should be a string")
+    if not (hass := _async_get_hass_or_none()):
+        # pylint: disable-next=import-outside-toplevel
+        from .frame import ReportBehavior, report_usage
 
-    template_value = template_helper.Template(str(value), _async_get_hass_or_none())
+        report_usage(
+            (
+                "validates schema outside the event loop, "
+                "which will stop working in HA Core 2025.10"
+            ),
+            core_behavior=ReportBehavior.LOG,
+        )
+
+    template_value = template_helper.Template(str(value), hass)
 
     try:
         template_value.ensure_valid()
@@ -733,8 +743,19 @@ def dynamic_template(value: Any | None) -> template_helper.Template:
         raise vol.Invalid("template value should be a string")
     if not template_helper.is_template_string(str(value)):
         raise vol.Invalid("template value does not contain a dynamic template")
+    if not (hass := _async_get_hass_or_none()):
+        # pylint: disable-next=import-outside-toplevel
+        from .frame import ReportBehavior, report_usage
 
-    template_value = template_helper.Template(str(value), _async_get_hass_or_none())
+        report_usage(
+            (
+                "validates schema outside the event loop, "
+                "which will stop working in HA Core 2025.10"
+            ),
+            core_behavior=ReportBehavior.LOG,
+        )
+
+    template_value = template_helper.Template(str(value), hass)
 
     try:
         template_value.ensure_valid()
@@ -850,7 +871,7 @@ def url_no_path(value: Any) -> str:
     url_in = url(value)
 
     if urlparse(url_in).path not in ("", "/"):
-        raise vol.Invalid("url it not allowed to have a path component")
+        raise vol.Invalid("url is not allowed to have a path component")
 
     return url_in
 
@@ -1091,7 +1112,13 @@ def key_dependency[_KT: Hashable, _VT](
 
 def custom_serializer(schema: Any) -> Any:
     """Serialize additional types for voluptuous_serialize."""
-    from .. import data_entry_flow  # pylint: disable=import-outside-toplevel
+    return _custom_serializer(schema, allow_section=True)
+
+
+def _custom_serializer(schema: Any, *, allow_section: bool) -> Any:
+    """Serialize additional types for voluptuous_serialize."""
+    from homeassistant import data_entry_flow  # pylint: disable=import-outside-toplevel
+
     from . import selector  # pylint: disable=import-outside-toplevel
 
     if schema is positive_time_period_dict:
@@ -1104,10 +1131,15 @@ def custom_serializer(schema: Any) -> Any:
         return {"type": "boolean"}
 
     if isinstance(schema, data_entry_flow.section):
+        if not allow_section:
+            raise ValueError("Nesting expandable sections is not supported")
         return {
             "type": "expandable",
             "schema": voluptuous_serialize.convert(
-                schema.schema, custom_serializer=custom_serializer
+                schema.schema,
+                custom_serializer=functools.partial(
+                    _custom_serializer, allow_section=False
+                ),
             ),
             "expanded": not schema.options["collapsed"],
         }
@@ -1119,41 +1151,6 @@ def custom_serializer(schema: Any) -> Any:
         return schema.serialize()
 
     return voluptuous_serialize.UNSUPPORTED
-
-
-def expand_condition_shorthand(value: Any | None) -> Any:
-    """Expand boolean condition shorthand notations."""
-
-    if not isinstance(value, dict) or CONF_CONDITIONS in value:
-        return value
-
-    for key, schema in (
-        ("and", AND_CONDITION_SHORTHAND_SCHEMA),
-        ("or", OR_CONDITION_SHORTHAND_SCHEMA),
-        ("not", NOT_CONDITION_SHORTHAND_SCHEMA),
-    ):
-        try:
-            schema(value)
-            return {
-                CONF_CONDITION: key,
-                CONF_CONDITIONS: value[key],
-                **{k: value[k] for k in value if k != key},
-            }
-        except vol.MultipleInvalid:
-            pass
-
-    if isinstance(value.get(CONF_CONDITION), list):
-        try:
-            CONDITION_SHORTHAND_SCHEMA(value)
-            return {
-                CONF_CONDITION: "and",
-                CONF_CONDITIONS: value[CONF_CONDITION],
-                **{k: value[k] for k in value if k != CONF_CONDITION},
-            }
-        except vol.MultipleInvalid:
-            pass
-
-    return value
 
 
 # Schemas
@@ -1305,9 +1302,28 @@ TARGET_SERVICE_FIELDS = {
 _HAS_ENTITY_SERVICE_FIELD = has_at_least_one_key(*ENTITY_SERVICE_FIELDS)
 
 
+def is_entity_service_schema(validator: VolSchemaType) -> bool:
+    """Check if the passed validator is an entity schema validator.
+
+    The validator must be either of:
+    - A validator returned by cv._make_entity_service_schema
+    - A validator returned by cv._make_entity_service_schema, wrapped in a vol.Schema
+    - A validator returned by cv._make_entity_service_schema, wrapped in a vol.All
+    Nesting is allowed.
+    """
+    if hasattr(validator, "_entity_service_schema"):
+        return True
+    if isinstance(validator, (vol.All)):
+        return any(is_entity_service_schema(val) for val in validator.validators)
+    if isinstance(validator, (vol.Schema)):
+        return is_entity_service_schema(validator.schema)
+
+    return False
+
+
 def _make_entity_service_schema(schema: dict, extra: int) -> VolSchemaType:
     """Create an entity service schema."""
-    return vol.All(
+    validator = vol.All(
         vol.Schema(
             {
                 # The frontend stores data here. Don't use in core.
@@ -1319,6 +1335,8 @@ def _make_entity_service_schema(schema: dict, extra: int) -> VolSchemaType:
         ),
         _HAS_ENTITY_SERVICE_FIELD,
     )
+    setattr(validator, "_entity_service_schema", True)
+    return validator
 
 
 BASE_ENTITY_SCHEMA = _make_entity_service_schema({}, vol.PREVENT_EXTRA)
@@ -1518,10 +1536,10 @@ TIME_CONDITION_SCHEMA = vol.All(
             **CONDITION_BASE_SCHEMA,
             vol.Required(CONF_CONDITION): "time",
             vol.Optional("before"): vol.Any(
-                time, vol.All(str, entity_domain(["input_datetime", "sensor"]))
+                time, vol.All(str, entity_domain(["input_datetime", "time", "sensor"]))
             ),
             vol.Optional("after"): vol.Any(
-                time, vol.All(str, entity_domain(["input_datetime", "sensor"]))
+                time, vol.All(str, entity_domain(["input_datetime", "time", "sensor"]))
             ),
             vol.Optional("weekday"): weekdays,
         }
@@ -1630,7 +1648,43 @@ DEVICE_CONDITION_BASE_SCHEMA = vol.Schema(
 
 DEVICE_CONDITION_SCHEMA = DEVICE_CONDITION_BASE_SCHEMA.extend({}, extra=vol.ALLOW_EXTRA)
 
-dynamic_template_condition_action = vol.All(
+
+def expand_condition_shorthand(value: Any | None) -> Any:
+    """Expand boolean condition shorthand notations."""
+
+    if not isinstance(value, dict) or CONF_CONDITIONS in value:
+        return value
+
+    for key, schema in (
+        ("and", AND_CONDITION_SHORTHAND_SCHEMA),
+        ("or", OR_CONDITION_SHORTHAND_SCHEMA),
+        ("not", NOT_CONDITION_SHORTHAND_SCHEMA),
+    ):
+        try:
+            schema(value)
+            return {
+                CONF_CONDITION: key,
+                CONF_CONDITIONS: value[key],
+                **{k: value[k] for k in value if k != key},
+            }
+        except vol.MultipleInvalid:
+            pass
+
+    if isinstance(value.get(CONF_CONDITION), list):
+        try:
+            CONDITION_SHORTHAND_SCHEMA(value)
+            return {
+                CONF_CONDITION: "and",
+                CONF_CONDITIONS: value[CONF_CONDITION],
+                **{k: value[k] for k in value if k != CONF_CONDITION},
+            }
+        except vol.MultipleInvalid:
+            pass
+
+    return value
+
+
+dynamic_template_condition = vol.All(
     # Wrap a shorthand template condition in a template condition
     dynamic_template,
     lambda config: {
@@ -1671,7 +1725,7 @@ CONDITION_SCHEMA: vol.Schema = vol.Schema(
                 },
             ),
         ),
-        dynamic_template_condition_action,
+        dynamic_template_condition,
     )
 )
 
@@ -1714,6 +1768,32 @@ CONDITION_ACTION_SCHEMA: vol.Schema = vol.Schema(
     )
 )
 
+
+def _trigger_pre_validator(value: Any | None) -> Any:
+    """Rewrite trigger `trigger` to `platform`.
+
+    `platform` has been renamed to `trigger` in user documentation and in the automation
+    editor. The Python trigger implementation still uses `platform`, so we need to
+    rename `trigger` to `platform.
+    """
+
+    if not isinstance(value, Mapping):
+        # If the value is not a mapping, we let that be handled by the TRIGGER_SCHEMA
+        return value
+
+    if CONF_TRIGGER in value:
+        if CONF_PLATFORM in value:
+            raise vol.Invalid(
+                "Cannot specify both 'platform' and 'trigger'. Please use 'trigger' only."
+            )
+        value = dict(value)
+        value[CONF_PLATFORM] = value.pop(CONF_TRIGGER)
+    elif CONF_PLATFORM not in value:
+        raise vol.Invalid("required key not provided", [CONF_TRIGGER])
+
+    return value
+
+
 TRIGGER_BASE_SCHEMA = vol.Schema(
     {
         vol.Optional(CONF_ALIAS): str,
@@ -1728,6 +1808,19 @@ TRIGGER_BASE_SCHEMA = vol.Schema(
 _base_trigger_validator_schema = TRIGGER_BASE_SCHEMA.extend({}, extra=vol.ALLOW_EXTRA)
 
 
+def _base_trigger_list_flatten(triggers: list[Any]) -> list[Any]:
+    """Flatten trigger arrays containing 'triggers:' sublists into a single list of triggers."""
+    flatlist = []
+    for t in triggers:
+        if CONF_TRIGGERS in t and len(t) == 1:
+            triggerlist = ensure_list(t[CONF_TRIGGERS])
+            flatlist.extend(triggerlist)
+        else:
+            flatlist.append(t)
+
+    return flatlist
+
+
 # This is first round of validation, we don't want to process the config here already,
 # just ensure basics as platform and ID are there.
 def _base_trigger_validator(value: Any) -> Any:
@@ -1735,7 +1828,11 @@ def _base_trigger_validator(value: Any) -> Any:
     return value
 
 
-TRIGGER_SCHEMA = vol.All(ensure_list, [_base_trigger_validator])
+TRIGGER_SCHEMA = vol.All(
+    ensure_list,
+    _base_trigger_list_flatten,
+    [vol.All(_trigger_pre_validator, _base_trigger_validator)],
+)
 
 _SCRIPT_DELAY_SCHEMA = vol.Schema(
     {
@@ -1777,12 +1874,8 @@ _SCRIPT_REPEAT_SCHEMA = vol.Schema(
                 vol.Exclusive(CONF_FOR_EACH, "repeat"): vol.Any(
                     dynamic_template, vol.All(list, template_complex)
                 ),
-                vol.Exclusive(CONF_WHILE, "repeat"): vol.All(
-                    ensure_list, [CONDITION_SCHEMA]
-                ),
-                vol.Exclusive(CONF_UNTIL, "repeat"): vol.All(
-                    ensure_list, [CONDITION_SCHEMA]
-                ),
+                vol.Exclusive(CONF_WHILE, "repeat"): CONDITIONS_SCHEMA,
+                vol.Exclusive(CONF_UNTIL, "repeat"): CONDITIONS_SCHEMA,
                 vol.Required(CONF_SEQUENCE): SCRIPT_SCHEMA,
             },
             has_at_least_one_key(CONF_COUNT, CONF_FOR_EACH, CONF_WHILE, CONF_UNTIL),
@@ -1798,9 +1891,7 @@ _SCRIPT_CHOOSE_SCHEMA = vol.Schema(
             [
                 {
                     vol.Optional(CONF_ALIAS): string,
-                    vol.Required(CONF_CONDITIONS): vol.All(
-                        ensure_list, [CONDITION_SCHEMA]
-                    ),
+                    vol.Required(CONF_CONDITIONS): CONDITIONS_SCHEMA,
                     vol.Required(CONF_SEQUENCE): SCRIPT_SCHEMA,
                 }
             ],
@@ -1821,7 +1912,7 @@ _SCRIPT_WAIT_FOR_TRIGGER_SCHEMA = vol.Schema(
 _SCRIPT_IF_SCHEMA = vol.Schema(
     {
         **SCRIPT_ACTION_BASE_SCHEMA,
-        vol.Required(CONF_IF): vol.All(ensure_list, [CONDITION_SCHEMA]),
+        vol.Required(CONF_IF): CONDITIONS_SCHEMA,
         vol.Required(CONF_THEN): SCRIPT_SCHEMA,
         vol.Optional(CONF_ELSE): SCRIPT_SCHEMA,
     }

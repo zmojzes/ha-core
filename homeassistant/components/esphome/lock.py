@@ -18,6 +18,8 @@ from .entity import (
     platform_async_setup_entry,
 )
 
+PARALLEL_UPDATES = 0
+
 
 class EsphomeLock(EsphomeEntity[LockInfo, LockEntityState], LockEntity):
     """A lock implementation for ESPHome."""
@@ -68,7 +70,7 @@ class EsphomeLock(EsphomeEntity[LockInfo, LockEntityState], LockEntity):
     @convert_api_error_ha_error
     async def async_unlock(self, **kwargs: Any) -> None:
         """Unlock the lock."""
-        code = kwargs.get(ATTR_CODE, None)
+        code = kwargs.get(ATTR_CODE)
         self._client.lock_command(self._key, LockCommand.UNLOCK, code)
 
     @convert_api_error_ha_error

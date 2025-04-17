@@ -10,6 +10,7 @@ import lcn_frontend as lcn_panel
 import voluptuous as vol
 
 from homeassistant.components import panel_custom, websocket_api
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.components.websocket_api import AsyncWebSocketCommandHandler
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -17,13 +18,15 @@ from homeassistant.const import (
     CONF_DEVICES,
     CONF_DOMAIN,
     CONF_ENTITIES,
-    CONF_ENTITY_ID,
     CONF_NAME,
     CONF_RESOURCE,
 )
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import device_registry as dr, entity_registry as er
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+)
 
 from .const import (
     ADD_ENTITIES_CALLBACKS,
@@ -77,10 +80,14 @@ async def register_panel_and_ws_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_delete_entity)
 
     if DOMAIN not in hass.data.get("frontend_panels", {}):
-        hass.http.register_static_path(
-            URL_BASE,
-            path=lcn_panel.locate_dir(),
-            cache_headers=lcn_panel.is_prod_build,
+        await hass.http.async_register_static_paths(
+            [
+                StaticPathConfig(
+                    URL_BASE,
+                    path=lcn_panel.locate_dir(),
+                    cache_headers=lcn_panel.is_prod_build,
+                )
+            ]
         )
         await panel_custom.async_register_panel(
             hass=hass,
@@ -98,7 +105,6 @@ def get_config_entry(
 ) -> AsyncWebSocketCommandHandler:
     """Websocket decorator to ensure the config_entry exists and return it."""
 
-    @callback
     @wraps(func)
     async def get_entry(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
@@ -154,20 +160,13 @@ async def websocket_get_entity_configs(
     else:
         entity_configs = config_entry.data[CONF_ENTITIES]
 
-    entity_registry = er.async_get(hass)
-    for entity_config in entity_configs:
-        entity_unique_id = generate_unique_id(
-            config_entry.entry_id,
-            entity_config[CONF_ADDRESS],
-            entity_config[CONF_RESOURCE],
-        )
-        entity_id = entity_registry.async_get_entity_id(
-            entity_config[CONF_DOMAIN], DOMAIN, entity_unique_id
-        )
+    result_entity_configs = [
+        {**entity_config, CONF_NAME: entity.name or entity.original_name}
+        for entity_config in entity_configs[:]
+        if (entity := get_entity_entry(hass, entity_config, config_entry)) is not None
+    ]
 
-        entity_config[CONF_ENTITY_ID] = entity_id
-
-    connection.send_result(msg["id"], entity_configs)
+    connection.send_result(msg["id"], result_entity_configs)
 
 
 @websocket_api.require_admin
@@ -350,11 +349,10 @@ async def websocket_add_entity(
     }
 
     # Create new entity and add to corresponding component
-    callbacks = hass.data[DOMAIN][msg["entry_id"]][ADD_ENTITIES_CALLBACKS]
-    async_add_entities, create_lcn_entity = callbacks[msg[CONF_DOMAIN]]
-
-    entity = create_lcn_entity(hass, entity_config, config_entry)
-    async_add_entities([entity])
+    add_entities = hass.data[DOMAIN][msg["entry_id"]][ADD_ENTITIES_CALLBACKS][
+        msg[CONF_DOMAIN]
+    ]
+    add_entities([entity_config])
 
     # Add entity config to config_entry
     entity_configs = [*config_entry.data[CONF_ENTITIES], entity_config]
@@ -428,23 +426,40 @@ async def async_create_or_update_device_in_config_entry(
         device_connection.is_group,
     )
 
-    device_configs = [*config_entry.data[CONF_DEVICES]]
-    data = {**config_entry.data, CONF_DEVICES: device_configs}
-    for device_config in data[CONF_DEVICES]:
-        if tuple(device_config[CONF_ADDRESS]) == address:
-            break  # device already in config_entry
-    else:
-        # create new device_entry
-        device_config = {
-            CONF_ADDRESS: address,
-            CONF_NAME: "",
-            CONF_HARDWARE_SERIAL: -1,
-            CONF_SOFTWARE_SERIAL: -1,
-            CONF_HARDWARE_TYPE: -1,
-        }
-        data[CONF_DEVICES].append(device_config)
+    device_config = {
+        CONF_ADDRESS: address,
+        CONF_NAME: "",
+        CONF_HARDWARE_SERIAL: -1,
+        CONF_SOFTWARE_SERIAL: -1,
+        CONF_HARDWARE_TYPE: -1,
+    }
 
-    # update device_entry
+    device_configs = [
+        device
+        for device in config_entry.data[CONF_DEVICES]
+        if tuple(device[CONF_ADDRESS]) != address
+    ]
+    data = {**config_entry.data, CONF_DEVICES: [*device_configs, device_config]}
+
     await async_update_device_config(device_connection, device_config)
-
     hass.config_entries.async_update_entry(config_entry, data=data)
+
+
+def get_entity_entry(
+    hass: HomeAssistant, entity_config: dict, config_entry: ConfigEntry
+) -> er.RegistryEntry | None:
+    """Get entity RegistryEntry from entity_config."""
+    entity_registry = er.async_get(hass)
+    domain_name = entity_config[CONF_DOMAIN]
+    domain_data = entity_config[CONF_DOMAIN_DATA]
+    resource = get_resource(domain_name, domain_data).lower()
+    unique_id = generate_unique_id(
+        config_entry.entry_id,
+        entity_config[CONF_ADDRESS],
+        resource,
+    )
+    if (
+        entity_id := entity_registry.async_get_entity_id(domain_name, DOMAIN, unique_id)
+    ) is None:
+        return None
+    return entity_registry.async_get(entity_id)

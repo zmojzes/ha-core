@@ -4,9 +4,10 @@ from typing import Any
 from unittest.mock import patch
 
 from aioesphomeapi import DeviceInfo, InvalidAuthAPIError
+import pytest
 
 from homeassistant.components.esphome import CONF_NOISE_PSK, coordinator, dashboard
-from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 
@@ -63,13 +64,51 @@ async def test_restore_dashboard_storage_end_to_end(
         "key": dashboard.STORAGE_KEY,
         "data": {"info": {"addon_slug": "test-slug", "host": "new-host", "port": 6052}},
     }
-    with patch(
-        "homeassistant.components.esphome.coordinator.ESPHomeDashboardAPI"
-    ) as mock_dashboard_api:
+    with (
+        patch(
+            "homeassistant.components.esphome.dashboard.is_hassio", return_value=False
+        ),
+        patch(
+            "homeassistant.components.esphome.coordinator.ESPHomeDashboardAPI"
+        ) as mock_dashboard_api,
+    ):
         await hass.config_entries.async_setup(mock_config_entry.entry_id)
         await hass.async_block_till_done()
         assert mock_config_entry.state is ConfigEntryState.LOADED
         assert mock_dashboard_api.mock_calls[0][1][0] == "http://new-host:6052"
+
+
+async def test_restore_dashboard_storage_skipped_if_addon_uninstalled(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Restore dashboard restore is skipped if the addon is uninstalled."""
+    hass_storage[dashboard.STORAGE_KEY] = {
+        "version": dashboard.STORAGE_VERSION,
+        "minor_version": dashboard.STORAGE_VERSION,
+        "key": dashboard.STORAGE_KEY,
+        "data": {"info": {"addon_slug": "test-slug", "host": "new-host", "port": 6052}},
+    }
+    with (
+        patch(
+            "homeassistant.components.esphome.coordinator.ESPHomeDashboardAPI"
+        ) as mock_dashboard_api,
+        patch(
+            "homeassistant.components.esphome.dashboard.is_hassio", return_value=True
+        ),
+        patch(
+            "homeassistant.components.hassio.get_addons_info",
+            return_value={},
+        ),
+    ):
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+        assert mock_config_entry.state is ConfigEntryState.LOADED
+        await hass.async_block_till_done()  # wait for dashboard setup
+        assert "test-slug is no longer installed" in caplog.text
+        assert not mock_dashboard_api.called
 
 
 async def test_setup_dashboard_fails(
@@ -150,7 +189,7 @@ async def test_new_info_reload_config_entries(
 
 
 async def test_new_dashboard_fix_reauth(
-    hass: HomeAssistant, mock_client, mock_config_entry, mock_dashboard
+    hass: HomeAssistant, mock_client, mock_config_entry: MockConfigEntry, mock_dashboard
 ) -> None:
     """Test config entries waiting for reauth are triggered."""
     mock_client.device_info.side_effect = (
@@ -162,14 +201,7 @@ async def test_new_dashboard_fix_reauth(
         "homeassistant.components.esphome.coordinator.ESPHomeDashboardAPI.get_encryption_key",
         return_value=VALID_NOISE_PSK,
     ) as mock_get_encryption_key:
-        result = await hass.config_entries.flow.async_init(
-            "esphome",
-            context={
-                "source": SOURCE_REAUTH,
-                "entry_id": mock_config_entry.entry_id,
-                "unique_id": mock_config_entry.unique_id,
-            },
-        )
+        result = await mock_config_entry.start_reauth_flow(hass)
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "reauth_confirm"
     assert len(mock_get_encryption_key.mock_calls) == 0
